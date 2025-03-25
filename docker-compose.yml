@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  db:
+    build:
+      context: ./db
+      dockerfile: Dockerfile # Specifies the Dockerfile in ./db
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: world_bank_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: fastapi
+    restart: always
+    depends_on:
+      - db
+    environment:
+      SECRET_KEY: "SKLCNJSH127934hd)&#!63446nZNalahegdnx&5235bdjPAnc;[ahdb]"
+      DATABASE_URL: postgresql+asyncpg://admin:admin@db:5432/world_bank_db
+    ports:
+      - "8000:80"
+
+volumes:
+  pgdata:
