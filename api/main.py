@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Query, status, HTTPException, Security
+from fastapi import FastAPI, Depends, HTTPException, Query, status, Security
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -8,10 +8,15 @@ import jwt
 from datetime import datetime, timedelta
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import time
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 SECRET_KEY = os.getenv("SECRET_KEY")  # Use a secure key in production
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_SECONDS = 30
+ACCESS_TOKEN_EXPIRE_SECONDS = 1
 
 # Database connection URL
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -31,7 +36,7 @@ async def get_db():
 app = FastAPI()
 
 fake_users_db = {
-    "johndoe": {"username": "admin@admin.com", "password": "admin"}
+    "johndoe": {"username": "johndoe", "password": "admin"}
 }
 
 class Login(BaseModel):
@@ -41,13 +46,16 @@ class Login(BaseModel):
 security = HTTPBearer()
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
+    logger.info(f"Authenticating request with token: {credentials.credentials[:10]}...")
     token = credentials.credentials
     payload = verify_jwt_token(token)
     if payload is None:
+        logger.warning("Authentication failed: Invalid or expired token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
         )
+    logger.info(f"Authentication successful for user: {payload['sub']}")
     return payload
 
 @app.get("/")
@@ -82,9 +90,11 @@ def verify_jwt_token(token: str):
         if decoded_token["exp"] >= int(time.time()):
             return decoded_token
         else:
+            logger.warning("Token has expired")
             return None  # Token is expired
         
-    except jwt.PyJWTError:
+    except jwt.PyJWTError as e:
+        logger.warning(f"JWT error: {str(e)}")
         return None  # Invalid token or error during decoding
     
 # Function to fetch data with optional country filter
@@ -109,6 +119,7 @@ async def get_gdp(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    logger.info(f"GDP endpoint accessed by user: {current_user['sub']}")
     query = """
         SELECT g.id, g.year, g.gdp_growth_rate, c.country_name, c.iso_code
         FROM gdp_growth g
@@ -119,8 +130,10 @@ async def get_gdp(
 @app.get("/api/population_growth")
 async def get_population(
     country: str = Query(None, description="Optional country ISO code"),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
+    logger.info(f"Population endpoint accessed by user: {current_user['sub']}")
     query = """
         SELECT p.id, p.year, p.population_growth_rate, c.country_name, c.iso_code
         FROM population_growth p
@@ -131,8 +144,10 @@ async def get_population(
 @app.get("/api/education_expenditure")
 async def get_education_expenditure(
     country: str = Query(None, description="Optional country ISO code"),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
+    logger.info(f"Education expenditure endpoint accessed by user: {current_user['sub']}")
     query = """
         SELECT e.id, e.year, e.expenditure_percentage, c.country_name, c.iso_code
         FROM gov_expenditure e
@@ -143,8 +158,10 @@ async def get_education_expenditure(
 @app.get("/api/inflation")
 async def get_inflation(
     country: str = Query(None, description="Optional country ISO code"),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
+    logger.info(f"Inflation endpoint accessed by user: {current_user['sub']}")
     query = """
         SELECT i.id, i.year, i.inflation_rate, c.country_name, c.iso_code
         FROM inflation i
@@ -155,8 +172,10 @@ async def get_inflation(
 @app.get("/api/labour_force")
 async def get_labour_force(
     country: str = Query(None, description="Optional country ISO code"),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
+    logger.info(f"Labour force endpoint accessed by user: {current_user['sub']}")
     query = """
         SELECT l.id, l.year, l.labour_force_total, c.country_name, c.iso_code
         FROM labour_force l
