@@ -1,22 +1,26 @@
-from fastapi import FastAPI, Depends, HTTPException, Query, status, Security
+from fastapi import FastAPI, Depends, HTTPException, Query, status, Security, APIRouter
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
 import os
 import jwt
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import time
 import logging
+from enum import Enum
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SECRET_KEY = os.getenv("SECRET_KEY")  # Use a secure key in production
+# Configuration
+SECRET_KEY = os.getenv("SECRET_KEY", "default-dev-key")  # Default for development
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_SECONDS = 1
+ACCESS_TOKEN_EXPIRE_MINUTES = 30  # More intuitive name
 
 # Database connection URL
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -30,57 +34,71 @@ async_session_maker = sessionmaker(engine, expire_on_commit=False, class_=AsyncS
 # Dependency to get DB session
 async def get_db():
     async with async_session_maker() as session:
-        yield session
+        try:
+            yield session
+        finally:
+            await session.close()
 
 # FastAPI app
-app = FastAPI()
+app = FastAPI(
+    title="Economic Data API",
+    description="API for accessing global economic indicators",
+    version="1.0.0"
+)
 
-fake_users_db = {
-    "johndoe": {"username": "johndoe", "password": "admin"}
-}
-
+# Models
 class Login(BaseModel):
     username: str
     password: str
 
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    expires_at: int
+
+class DataCategory(str, Enum):
+    GDP = "gdp"
+    POPULATION = "population"
+    EDUCATION = "education"
+    INFLATION = "inflation"
+    LABOUR = "labour"
+
+# User storage - in production, use a database
+fake_users_db = {
+    "johndoe": {"username": "johndoe", "password": "admin"}
+}
+
+# Security
 security = HTTPBearer()
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
     logger.info(f"Authenticating request with token: {credentials.credentials[:10]}...")
-    token = credentials.credentials
-    payload = verify_jwt_token(token)
-    if payload is None:
-        logger.warning("Authentication failed: Invalid or expired token")
+    try:
+        token = credentials.credentials
+        payload = verify_jwt_token(token)
+        if payload is None:
+            logger.warning("Authentication failed: Invalid or expired token")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        logger.info(f"Authentication successful for user: {payload['sub']}")
+        return payload
+    except Exception as e:
+        logger.error(f"Authentication error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
+            detail="Authentication failed",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    logger.info(f"Authentication successful for user: {payload['sub']}")
-    return payload
-
-@app.get("/")
-async def protected_route(current_user: dict = Depends(get_current_user)):
-    return {"message": f"Hello, {current_user['sub']}! You are authenticated."}
-
-@app.post("/api/login")
-async def login(user: Login):
-    db_user = fake_users_db.get(user.username)
-    if not db_user or db_user["password"] != user.password:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
-        )
-    
-    token_data = {"sub": user.username}
-    token = create_jwt_token(data=token_data)
-    return {"access_token": token, "token_type": "bearer"}
 
 def create_jwt_token(data: dict):
     to_encode = data.copy()
-    expire = int(time.time()) + (ACCESS_TOKEN_EXPIRE_SECONDS * 60)
+    expire = int(time.time()) + (ACCESS_TOKEN_EXPIRE_MINUTES * 60)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return encoded_jwt, expire
 
 def verify_jwt_token(token: str):
     try:
@@ -96,89 +114,186 @@ def verify_jwt_token(token: str):
     except jwt.PyJWTError as e:
         logger.warning(f"JWT error: {str(e)}")
         return None  # Invalid token or error during decoding
+
+# API Routers
+auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+data_router = APIRouter(prefix="/api/data", tags=["Economic Data"])
+
+@auth_router.post("/login", response_model=Token)
+async def login(user: Login):
+    """
+    Authenticate a user and return a JWT token
+    """
+    db_user = fake_users_db.get(user.username)
+    if not db_user or db_user["password"] != user.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
-# Function to fetch data with optional country filter
-async def fetch_data(query: str, db: AsyncSession, country: str = None):
+    token_data = {"sub": user.username}
+    token, expires_at = create_jwt_token(data=token_data)
+    return {"access_token": token, "token_type": "bearer", "expires_at": expires_at}
+
+@auth_router.get("/me")
+async def read_users_me(current_user: dict = Depends(get_current_user)):
+    """
+    Get information about the currently authenticated user
+    """
+    return {"username": current_user['sub']}
+
+# Centralized data fetching logic
+async def fetch_data(
+    db: AsyncSession, 
+    category: DataCategory, 
+    country: Optional[str] = None,
+    year: Optional[int] = None,
+    limit: int = 100,
+    offset: int = 0
+):
+    """Fetch data with filtering, sorting and pagination"""
+    
+    # Define base queries for each category
+    queries = {
+        DataCategory.GDP: """
+            SELECT g.id, g.year, g.gdp_growth_rate AS value, c.country_name, c.iso_code
+            FROM gdp_growth g
+            JOIN countries c ON g.country_id = c.country_id
+        """,
+        DataCategory.POPULATION: """
+            SELECT p.id, p.year, p.population_growth_rate AS value, c.country_name, c.iso_code
+            FROM population_growth p
+            JOIN countries c ON p.country_id = c.country_id
+        """,
+        DataCategory.EDUCATION: """
+            SELECT e.id, e.year, e.expenditure_percentage AS value, c.country_name, c.iso_code
+            FROM gov_expenditure e
+            JOIN countries c ON e.country_id = c.country_id
+        """,
+        DataCategory.INFLATION: """
+            SELECT i.id, i.year, i.inflation_rate AS value, c.country_name, c.iso_code
+            FROM inflation i
+            JOIN countries c ON i.country_id = c.country_id
+        """,
+        DataCategory.LABOUR: """
+            SELECT l.id, l.year, l.labour_force_total AS value, c.country_name, c.iso_code
+            FROM labour_force l
+            JOIN countries c ON l.country_id = c.country_id
+        """
+    }
+    
+    # Get the base query for the requested category
+    query = queries.get(category)
+    if not query:
+        raise HTTPException(status_code=400, detail=f"Invalid category: {category}")
+    
+    # Build where clause with parameters
+    where_clauses = []
+    params = {}
+    
     if country:
-        query += " WHERE c.iso_code = :country"
-        params = {"country": country.upper()}
-    else:
-        params = {}
+        where_clauses.append("c.iso_code = :country")
+        params["country"] = country.upper()
+    
+    if year:
+        table_prefix = category[0].lower() if category != DataCategory.LABOUR else "l"
+        where_clauses.append(f"{table_prefix}.year = :year")
+        params["year"] = year
+    
+    # Add WHERE clause if needed
+    if where_clauses:
+        query += " WHERE " + " AND ".join(where_clauses)
+    
+    # Add order by, limit and offset
+    query += " ORDER BY c.country_name, year DESC LIMIT :limit OFFSET :offset"
+    params["limit"] = limit
+    params["offset"] = offset
 
-    result = await db.execute(text(query), params)
-    data = result.mappings().all()
+    try:
+        # Execute query
+        result = await db.execute(text(query), params)
+        data = result.mappings().all()
+        
+        # Count total results without pagination
+        count_query = f"SELECT COUNT(*) as total FROM ({queries.get(category)}"
+        if where_clauses:
+            count_query += " WHERE " + " AND ".join(where_clauses)
+        count_query += ") AS count_query"
+        
+        count_result = await db.execute(text(count_query), params)
+        total_count = count_result.scalar_one()
+        
+        if not data:
+            return {"data": [], "total": 0, "limit": limit, "offset": offset}
+            
+        return {
+            "data": [dict(row) for row in data],
+            "total": total_count,
+            "limit": limit,
+            "offset": offset
+        }
+    except Exception as e:
+        logger.error(f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    if not data:
-        raise HTTPException(status_code=404, detail="No data found")
-
-    return data
-
-@app.get("/api/gdp")
-async def get_gdp(
-    country: str = Query(None, description="Optional country ISO code"),
+@data_router.get("/{category}")
+async def get_economic_data(
+    category: DataCategory,
+    country: Optional[str] = Query(None, description="Optional country ISO code"),
+    year: Optional[int] = Query(None, description="Filter by year"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of results to return"),
+    offset: int = Query(0, ge=0, description="Number of results to skip"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    logger.info(f"GDP endpoint accessed by user: {current_user['sub']}")
-    query = """
-        SELECT g.id, g.year, g.gdp_growth_rate, c.country_name, c.iso_code
-        FROM gdp_growth g
-        JOIN countries c ON g.country_id = c.country_id
     """
-    return {"gdp": await fetch_data(query, db, country)}
+    Get economic data by category with optional filtering
+    """
+    logger.info(f"{category.value.capitalize()} endpoint accessed by user: {current_user['sub']}")
+    
+    result = await fetch_data(
+        db=db,
+        category=category,
+        country=country,
+        year=year,
+        limit=limit,
+        offset=offset
+    )
+    
+    return result
 
-@app.get("/api/population_growth")
-async def get_population(
-    country: str = Query(None, description="Optional country ISO code"),
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
-    logger.info(f"Population endpoint accessed by user: {current_user['sub']}")
-    query = """
-        SELECT p.id, p.year, p.population_growth_rate, c.country_name, c.iso_code
-        FROM population_growth p
-        JOIN countries c ON p.country_id = c.country_id
-    """
-    return {"population": await fetch_data(query, db, country)}
+# Health check endpoint (no auth required)
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Check if the API is running"""
+    return {"status": "ok", "timestamp": int(time.time())}
 
-@app.get("/api/education_expenditure")
-async def get_education_expenditure(
-    country: str = Query(None, description="Optional country ISO code"),
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
-    logger.info(f"Education expenditure endpoint accessed by user: {current_user['sub']}")
-    query = """
-        SELECT e.id, e.year, e.expenditure_percentage, c.country_name, c.iso_code
-        FROM gov_expenditure e
-        JOIN countries c ON e.country_id = c.country_id
-    """
-    return {"education_expenditure": await fetch_data(query, db, country)}
+# Root endpoint (requires auth)
+@app.get("/", tags=["Root"])
+async def root(current_user: dict = Depends(get_current_user)):
+    """Root endpoint requiring authentication"""
+    return {
+        "message": f"Hello, {current_user['sub']}! You are authenticated.",
+        "documentation": "/docs"
+    }
 
-@app.get("/api/inflation")
-async def get_inflation(
-    country: str = Query(None, description="Optional country ISO code"),
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
-    logger.info(f"Inflation endpoint accessed by user: {current_user['sub']}")
-    query = """
-        SELECT i.id, i.year, i.inflation_rate, c.country_name, c.iso_code
-        FROM inflation i
-        JOIN countries c ON i.country_id = c.country_id
-    """
-    return {"inflation": await fetch_data(query, db, country)}
+# Include routers
+app.include_router(auth_router)
+app.include_router(data_router)
 
-@app.get("/api/labour_force")
-async def get_labour_force(
-    country: str = Query(None, description="Optional country ISO code"),
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
-    logger.info(f"Labour force endpoint accessed by user: {current_user['sub']}")
-    query = """
-        SELECT l.id, l.year, l.labour_force_total, c.country_name, c.iso_code
-        FROM labour_force l
-        JOIN countries c ON l.country_id = c.country_id
-    """
-    return {"labour_force": await fetch_data(query, db, country)}
+# Error handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "An unexpected error occurred"}
+    )
