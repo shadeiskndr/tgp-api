@@ -149,6 +149,8 @@ async def fetch_data(
     category: DataCategory, 
     country: Optional[str] = None,
     year: Optional[int] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
     limit: int = 100,
     offset: int = 0
 ):
@@ -196,10 +198,23 @@ async def fetch_data(
         where_clauses.append("c.iso_code = :country")
         params["country"] = country.upper()
     
+    # Determine table prefix for year columns
+    table_prefix = category[0].lower() if category != DataCategory.LABOUR else "l"
+    
+    # Handle year range filtering
     if year:
-        table_prefix = category[0].lower() if category != DataCategory.LABOUR else "l"
+        # Single year filter (for backward compatibility)
         where_clauses.append(f"{table_prefix}.year = :year")
         params["year"] = year
+    else:
+        # Year range filtering
+        if year_from:
+            where_clauses.append(f"{table_prefix}.year >= :year_from")
+            params["year_from"] = year_from
+        
+        if year_to:
+            where_clauses.append(f"{table_prefix}.year <= :year_to")
+            params["year_to"] = year_to
     
     # Add WHERE clause if needed
     if where_clauses:
@@ -241,7 +256,9 @@ async def fetch_data(
 async def get_economic_data(
     category: DataCategory,
     country: Optional[str] = Query(None, description="Optional country ISO code"),
-    year: Optional[int] = Query(None, description="Filter by year"),
+    year: Optional[int] = Query(None, description="Filter by specific year"),
+    year_from: Optional[int] = Query(None, description="Filter from year (inclusive)"),
+    year_to: Optional[int] = Query(None, description="Filter to year (inclusive)"),
     limit: int = Query(100, ge=1, le=1000, description="Number of results to return"),
     offset: int = Query(0, ge=0, description="Number of results to skip"),
     db: AsyncSession = Depends(get_db),
@@ -257,6 +274,8 @@ async def get_economic_data(
         category=category,
         country=country,
         year=year,
+        year_from=year_from,
+        year_to=year_to,
         limit=limit,
         offset=offset
     )
