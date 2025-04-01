@@ -252,6 +252,44 @@ async def fetch_data(
         logger.error(f"Database error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+@data_router.get("/countries")
+async def get_countries(
+    limit: int = Query(100, ge=1, le=1000, description="Number of results to return"),
+    offset: int = Query(0, ge=0, description="Number of results to skip"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get the list of all available countries with pagination
+    """
+    try:
+        # Query for paginated results
+        query = """
+            SELECT iso_code, country_name 
+            FROM countries 
+            ORDER BY country_name
+            LIMIT :limit OFFSET :offset
+        """
+        result = await db.execute(text(query), {"limit": limit, "offset": offset})
+        countries = result.mappings().all()
+        
+        # Count total results
+        count_query = "SELECT COUNT(*) as total FROM countries"
+        count_result = await db.execute(text(count_query))
+        total_count = count_result.scalar_one()
+        
+        # Format response consistent with other endpoints
+        return {
+            "data": [{"code": country["iso_code"], "name": country["country_name"]} for country in countries],
+            "total": total_count,
+            "limit": limit,
+            "offset": offset
+        }
+    except Exception as e:
+        logger.error(f"Database error when fetching countries: {str(e)}")
+        # Generic error message that doesn't expose database details
+        raise HTTPException(status_code=500, detail="An error occurred while retrieving countries")
+
 @data_router.get("/{category}")
 async def get_economic_data(
     category: DataCategory,
